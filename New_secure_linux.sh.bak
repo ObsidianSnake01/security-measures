@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+#
+# secure_linux.sh - baseline hardening for Debian/Ubuntu servers
+#
+# Usage: sudo ./secure_linux.sh [options]
+#   -n, --dry-run        Show what would change; modify nothing
+#   -e, --email ADDR     Send daily logwatch reports to ADDR (needs a working MTA)
+#   -p, --ssh-port N     SSH port (default: auto-detect, falls back to 22)
+#       --skip-ssh       Do not touch SSH configuration
+#       --skip-rkhunter  Do not install Rootkit Hunter
+#   -h, --help           Show this help
+#
+# Safe to re-run: every step is idempotent and config changes are backed up.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly LOG_FILE="/var/log/secure_linux.log"
+readonly BACKUP_DIR="/var/backups/hardening-$(date +%Y%m%d-%H%M%S)"
+
+DRY_RUN=false
+EMAIL=""
+SSH_PORT=""
+SKIP_SSH=false
+SKIP_RKHUNTER=false
+
+# ---------- helpers ----------------------------------------------------------
+
+log()  { printf '[%s] [+] %s\n' "$(date +%T)" "$*"; }
+warn() { printf '[%s] [!] %s\n' "$(date +%T)" "$*" >&2; }
+die()  { printf '[%s] [x] %s\n' "$(date +%T)" "$*" >&2; exit 1; }
+
+usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Run a command, or just print it in dry-run mode.
+run() {
+  if $DRY_RUN; then log "[dry-run] $*"; else "$@"; fi
+}
+
+# Write stdin to a file (mode 0644), backing up any existing one.
+# Skips the write when content is unchanged. Returns 0 if file changed.
+write_file() {
+  local path=$1 tmp
+  tmp=$(mktemp)
+  cat >"$tmp"
+  if [[ -f $path ]] && cmp -s "$tmp" "$path"; then
+    rm -f "$tmp"; log "Unchanged: $path"; return 1
+  fi
+  if $DRY_RUN; then
+    log "[dry-run] would write $path"; rm -f "$tmp"; return 0
+  fi
+  if [[ -f $path ]]; then
+    mkdir -p "$BACKUP_DIR"; cp -a "$path" "$BACKUP_DIR/"
+  fi
+  install -m 0644 "$tmp" "$path"; rm -f "$tmp"
+  log "Wrote $path"
+}
+
+pkg_install() {
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+}
+
+on_error() { warn "Failed at line $1 (exit $2). See $LOG_FILE. Backups: $BACKUP_DIR"; }
+trap 'on_error $LINENO $?' ERR
+
+# ---------- preflight --------------------------------------------------------
+
+parse_args() {
+  while (($#)); do
+    case $1 in
+      -n|--dry-run)       DRY_RUN=true ;;
+      -e|--email)         EMAIL=${2:?--email needs an address}; shift ;;
+      -p|--ssh-port)      SSH_PORT=${2:?--ssh-port needs a number}; shift ;;
+      --skip-ssh)         SKIP_SSH=true ;;
+      --skip-rkhunter)    SKIP_RKHUNTER=true ;;
+      -h|--help)          usage; exit 0 ;;
+      *)                  usage; die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+  if [[ -n $EMAIL && ! $EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    die "Invalid email address: $EMAIL"
+  fi
+  if [[ -n $SSH_PORT && ! $SSH_PORT =~ ^[0-9]+$ ]]; then
+    die "Invalid SSH port: $SSH_PORT"
+  fi
+}
+
+preflight() {
+  [[ $EUID -eq 0 ]] || die "Run as root (try: sudo $SCRIPT_NAME)"
+  command -v apt-get >/dev/null || die "This script supports Debian/Ubuntu (apt) only"
+  if ! $DRY_RUN; then
+    mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+  fi
+  log "Starting $SCRIPT_NAME (dry-run: $DRY_RUN)"
+}
+
+# ---------- steps ------------------------------------------------------------
+
+update_system() {
+  log "Updating packages"
+  run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  run env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade
+}
+
+enable_auto_updates() {
+  log "Enabling unattended security updates"
+  pkg_install unattended-upgrades
+  write_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF' || true
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+}
+
+# True if root or any human sudo user already has an SSH key installed.
+# Disabling password auth without one would lock everyone out.
+have_authorized_keys() {
+  local f
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [[ -s $f ]] && return 0
+  done
+  return 1
+}
+
+have_sudo_user() {
+  local u
+  for u in $(getent group sudo | cut -d: -f4 | tr ',' '\n'); do
+    [[ -n $u && $u != root ]] && return 0
+  done
+  return 1
+}
+
+harden_ssh() {
+  $SKIP_SSH && { log "Skipping SSH hardening (--skip-ssh)"; return; }
+  command -v sshd >/dev/null || pkg_install openssh-server
+
+  local password_auth="no" root_login="no"
+  if ! have_authorized_keys; then
+    warn "No authorized_keys found for any user - KEEPING password auth enabled to avoid lockout."
+    warn "From your own machine run: ssh-copy-id user@this-host   then re-run this script."
+    password_auth="yes"
+  fi
+  if ! have_sudo_user; then
+    warn "No non-root sudo user found - setting PermitRootLogin to prohibit-password instead of no."
+    root_login="prohibit-password"
+  fi
+
+  # Drop-in instead of sed on sshd_config. OpenSSH uses the FIRST value it sees,
+  # and files in sshd_config.d are read in lexical order, so 00- wins over
+  # distro/cloud-init files such as 50-cloud-init.conf.
+  local dropin=/etc/ssh/sshd_config.d/00-hardening.conf
+  grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null \
+    || warn "sshd_config has no Include for sshd_config.d; drop-in may be ignored (old OpenSSH?)."
+  run mkdir -p /etc/ssh/sshd_config.d
+
+  local changed=0
+  write_file "$dropin" <<EOF || changed=1
+# Managed by $SCRIPT_NAME
+PasswordAuthentication $password_auth
+KbdInteractiveAuthentication $password_auth
+PermitRootLogin $root_login
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+MaxAuthTries 3
+LoginGraceTime 30
+MaxStartups 10:30:60
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+  # write_file returns 1 when unchanged, so invert: changed==0 means we wrote.
+  if $DRY_RUN; then return; fi
+
+  # Correct permissions: private host keys 600, directory traversable.
+  chmod 755 /etc/ssh /etc/ssh/sshd_config.d
+  chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+  chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+
+  # Never reload with a config sshd rejects.
+  if ! sshd -t; then
+    [[ -f $BACKUP_DIR/00-hardening.conf ]] \
+      && cp -a "$BACKUP_DIR/00-hardening.conf" "$dropin" || rm -f "$dropin"
+    die "sshd config test failed; reverted drop-in."
+  fi
+
+  local svc=ssh
+  systemctl list-unit-files sshd.service >/dev/null 2>&1 \
+    && systemctl cat sshd.service >/dev/null 2>&1 && svc=sshd
+  systemctl reload "$svc"
+  log "SSH reloaded (password auth: $password_auth, root login: $root_login)"
+  log "Keep your current session open and test a NEW login before disconnecting."
+}
+
+detect_ssh_port() {
+  [[ -n $SSH_PORT ]] && return
+  if command -v sshd >/dev/null; then
+    SSH_PORT=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+  fi
+  SSH_PORT=${SSH_PORT:-22}
+}
+
+setup_firewall() {
+  log "Configuring UFW (SSH on port $SSH_PORT)"
+  pkg_install ufw
+  run ufw default deny incoming
+  run ufw default allow outgoing
+  # 'limit' = allow + rate-limit repeated connection attempts
+  run ufw limit "${SSH_PORT}/tcp" comment 'SSH (rate limited)'
+  run ufw --force enable
+}
+
+setup_fail2ban() {
+  log "Configuring Fail2Ban"
+  pkg_install fail2ban
+  # jail.d drop-in survives package upgrades; copying jail.conf does not.
+  run mkdir -p /etc/fail2ban/jail.d
+  local changed=0
+  write_file /etc/fail2ban/jail.d/10-hardening.local <<EOF || changed=1
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+bantime.increment = true
+
+[sshd]
+enabled = true
+port    = $SSH_PORT
+EOF
+  run systemctl enable --now fail2ban
+  ((changed == 0)) && run systemctl restart fail2ban || true
+}
+
+apply_sysctl() {
+  log "Applying kernel/network hardening (sysctl)"
+  local changed=0
+  write_file /etc/sysctl.d/99-hardening.conf <<'EOF' || changed=1
+# Managed by secure_linux.sh
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.randomize_va_space = 2
+fs.suid_dumpable = 0
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+EOF
+  run sysctl --system >/dev/null
+}
+
+setup_logwatch() {
+  [[ -n $EMAIL ]] || { log "No --email given; skipping logwatch"; return; }
+  log "Configuring logwatch daily report to $EMAIL"
+  pkg_install logwatch
+  command -v sendmail >/dev/null \
+    || warn "No MTA (sendmail) found - install postfix/msmtp or reports won't be delivered."
+  # Debian's logwatch package already runs daily via /etc/cron.daily,
+  # so we only set options (no duplicate crontab entries on re-run).
+  run mkdir -p /etc/logwatch/conf
+  write_file /etc/logwatch/conf/logwatch.conf <<EOF || true
+Output = mail
+Format = html
+MailTo = $EMAIL
+Detail = Med
+Range = yesterday
+EOF
+}
+
+setup_rkhunter() {
+  $SKIP_RKHUNTER && { log "Skipping rkhunter (--skip-rkhunter)"; return; }
+  log "Installing Rootkit Hunter"
+  pkg_install rkhunter
+  run rkhunter --propupd >/dev/null 2>&1 || warn "rkhunter baseline (--propupd) failed"
+}
+
+summary() {
+  log "Done. Log: $LOG_FILE"
+  $DRY_RUN || log "Config backups (if any): $BACKUP_DIR"
+  $DRY_RUN || { ufw status verbose | sed 's/^/    /'; }
+}
+
+# ---------- main -------------------------------------------------------------
+
+main() {
+  parse_args "$@"
+  preflight
+  update_system
+  enable_auto_updates
+  harden_ssh
+  detect_ssh_port
+  setup_firewall
+  setup_fail2ban
+  apply_sysctl
+  setup_logwatch
+  setup_rkhunter
+  summary
+}
+
+main "$@"
